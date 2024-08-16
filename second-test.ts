@@ -40,6 +40,11 @@ type FetchError = {
     error: Error
 }
 
+type POSTError = {
+    type: 'POSTError'
+    error: Error
+}
+
 type JSONParseError = {
     type: 'JSONParseError'
     error: Error
@@ -57,7 +62,20 @@ const fetchAPI = TE.tryCatchK(
         type: 'FetchError',
         error: (err instanceof Error ? err : new Error('unexpected error when fetching data'))
     })
-);
+)
+
+const sendPOST = TE.tryCatchK(
+    (url: string, stringifiedData: string) => fetch(
+        url, {
+            method: 'POST',
+            body: stringifiedData,
+        }
+    ),
+    (err): POSTError => ({
+        type: 'POSTError',
+        error: (err instanceof Error ? err : new Error('unexpected error when sending POST request'))
+    })
+)
 
 const getResponseAsJson = TE.tryCatchK(
     (body: Response) => body.json(),
@@ -66,7 +84,6 @@ const getResponseAsJson = TE.tryCatchK(
         error: (err instanceof Error ? err : new Error('unexpected error when parsing json'))
     })
 )
-
 
 const parseSchema = <T>(content: any, schema: t.Decoder<Record<string, any>, T>) => pipe(
     content,
@@ -118,6 +135,8 @@ const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
             return inv
     }
 }, (err) => err)
+
+const payPayment = () => true // declare payment as paid
 
 const secondTestMain = async () => {
     const getData = pipe(
