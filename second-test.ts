@@ -1,5 +1,4 @@
-import { identity, pipe } from 'fp-ts/lib/function'
-import{ makeMatch } from 'ts-adt/MakeADT'
+import { pipe } from 'fp-ts/lib/function'
 import * as TE from 'fp-ts/TaskEither';
 import * as A from "fp-ts/Array";
 import * as E from 'fp-ts/Either'
@@ -20,7 +19,8 @@ const Invoice = t.type({
     organization_id: t.string,
     currency: t.string,
     type: t.string,
-    payments: t.union([t.array(Payment), t.undefined])
+    reference: t.union([t.string, t.undefined]),
+    payments: t.union([t.array(Payment), t.undefined]),
 })
 
 const Invoices = t.array(Invoice)
@@ -80,20 +80,14 @@ const parseSchema = <T>(content: any, schema: t.Decoder<Record<string, any>, T>)
     )
 )
 
-const getOrganizationCurrency = async (organization_id: string) => {
-    const orgUrl = `https://recruiting.api.bemmbo.com/organization/${organization_id}/settings`
-    const getOrgSettings = pipe(
-        orgUrl,
-        fetchAPI,
-        TE.flatMap(getResponseAsJson),
-        TE.flatMap((maybeOrgSettings) => parseSchema(maybeOrgSettings, OrgSettings)),
-    )
-    const orgSettings = await getOrgSettings()
-    if (E.isLeft(orgSettings)) {
-        return "UNKNOWN"
-    }
-    return orgSettings.right.currency
-}
+const getOrganizationCurrency = (organization_id: string) => pipe(
+    organization_id,
+    (oId) => `https://recruiting.api.bemmbo.com/organization/${oId}/settings`,
+    fetchAPI,
+    TE.flatMap(getResponseAsJson),
+    TE.flatMap((maybeOrgSettings) => parseSchema(maybeOrgSettings, OrgSettings)),
+    TE.map((settings) => settings.currency)
+)
 
 const normalizePayment = (payment: Payment, factor: number) => {
     payment.amount = Math.round(payment.amount * factor)
@@ -101,23 +95,25 @@ const normalizePayment = (payment: Payment, factor: number) => {
 }
 
 const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
-    const currency = await getOrganizationCurrency(inv.organization_id)
+    const currencyOut = await getOrganizationCurrency(inv.organization_id)()
+    if (E.isLeft(currencyOut)) {
+        return inv
+    }
+    const currency = currencyOut.right;
     if (currency === inv.currency) {
         return inv
     }
     switch (currency) {
         case "CLP": // USD to CLP
-            inv.amount = inv.amount * dollarInCLP
-            if (inv.payments) {
-                inv.payments = inv.payments.map((pm) => normalizePayment(pm, dollarInCLP))
+            return {...inv,
+                amount: inv.amount * dollarInCLP,
+                payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, dollarInCLP)) : undefined,
             }
-            return inv
         case "USD": // CLP to USD
-            inv.amount = Math.round(inv.amount / dollarInCLP)
-            if (inv.payments) {
-                inv.payments = inv.payments.map((pm) => normalizePayment(pm, 1/dollarInCLP))
+            return { ...inv, 
+                amount: Math.round(inv.amount / dollarInCLP),
+                payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, 1/dollarInCLP)) : undefined,
             }
-            return inv
         default:
             return inv
     }
@@ -129,16 +125,42 @@ const secondTestMain = async () => {
         fetchAPI,
         TE.flatMap(getResponseAsJson),
         TE.flatMap((invs) => parseSchema(invs, Invoices)),
+        TE.flatMap((invoices) => pipe(invoices, A.map(normalizeCurrency), A.sequence(TE.ApplicativeSeq)))
     )
 
     const fetchedData = await getData()
-    if(E.isLeft(fetchedData)){
+    if(E.isLeft(fetchedData)){ // On error, return
         return
     }
+
     const invoices = fetchedData.right
-    console.log(invoices)
-    const normalizedInvoices = await pipe(invoices, A.map(normalizeCurrency), A.sequence(TE.ApplicativeSeq))()
-    console.log(normalizedInvoices)
+    const receivedInvs = invoices.filter((inv) => inv.type === 'received')
+    const creditNotes = invoices.filter((inv) => inv.type === 'credit_note')
+
+    for (let i = 0; i < receivedInvs.length; i++) {
+        const invoice = receivedInvs[i]
+        if (!invoice.payments) {
+            continue
+        }
+        const creditNotesForInvoice = creditNotes.filter((cn) => cn.reference === invoice.id)
+        let amountToReduce = creditNotesForInvoice.reduce((acc, cn) => acc + cn.amount, 0)
+        invoice.payments.sort((inv1, inv2) => inv1.amount - inv2.amount)
+
+        for (let j = 0; j < invoice.payments.length; j++) {
+            const payment = invoice.payments[j]
+            if (payment.status === 'paid') {
+                continue // nothing to do
+            } else if (amountToReduce >= payment.amount) {
+                amountToReduce -= payment.amount
+                // pay 0
+            } else {
+                const amountToPay = payment.amount - amountToReduce
+                amountToReduce = 0
+                // pay discounted payment
+            }
+        }
+        console.log(`Reducing ${amountToReduce} to invoice ${invoice.id}`)
+    }
 }
 secondTestMain()
 
