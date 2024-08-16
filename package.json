@@ -1,0 +1,10 @@
+{
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "fp-ts": "^2.16.9",
+    "io-ts": "^2.2.21",
+    "ts-adt": "^2.1.2"
+  }
+}
