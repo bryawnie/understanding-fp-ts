@@ -4,21 +4,19 @@ import * as A from 'fp-ts/Array';
 import * as E from 'fp-ts/Either';
 import * as J from 'fp-ts/Json';
 import * as t from 'io-ts';
-import { makeMatch } from 'ts-adt/MakeADT';
 import {
-    FetchError, POSTError, JSONParseError, SchemaParseError, JsonStringifyError,
+    FetchError, POSTError, JsonParseError, SchemaParseError, JsonStringifyError,
     Payment, Invoice, Invoices, OrgSettings, PaymentResponse,
-    WrongAmountError
-} from './types'
+    WrongAmountError,
+} from './types';
 
 const invoicesURL = 'https://recruiting.api.bemmbo.com/v2/invoices/pending';
 const dollarInCLP = 800;
 
-
 const fetchAPI = TE.tryCatchK(
     (url: string) => fetch(url),
     (err): FetchError => ({
-        type: 'FetchError',
+        type: 'FetchError' as const,
         error: (err instanceof Error ? err : new Error('unexpected error when fetching data'))
     })
 )
@@ -31,15 +29,15 @@ const sendPOST = (url: string) => TE.tryCatchK(
         }
     ),
     (err): POSTError => ({
-        type: 'POSTError',
+        type: 'POSTError' as const,
         error: (err instanceof Error ? err : new Error('unexpected error when sending POST request'))
     })
 )
 
 const getResponseAsJson = TE.tryCatchK(
     (body: Response) => body.json(),
-    (err): JSONParseError => ({
-        type: 'JSONParseError',
+    (err): JsonParseError => ({
+        type: 'JsonParseError' as const,
         error: (err instanceof Error ? err : new Error('unexpected error when parsing json'))
     })
 )
@@ -50,7 +48,7 @@ const createResponse = (payload: unknown): E.Either<JsonStringifyError, string> 
         J.stringify,
         E.mapLeft(
             (e): JsonStringifyError => ({
-                type: 'JsonStringifyError',
+                type: 'JsonStringifyError' as const,
                 error: E.toError(e),
             })
         )
@@ -61,7 +59,7 @@ const parseSchema = <T>(content: any, schema: t.Decoder<Record<string, any>, T>)
     schema.decode,
     E.foldW(
         () => TE.left({
-            type: 'SchemaParseError',
+            type: 'SchemaParseError' as const,
             error: new Error('json does not contain the requested schema')
         }),
         (data) => TE.right(data),
@@ -96,11 +94,13 @@ const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
             return {...inv,
                 amount: inv.amount * dollarInCLP,
                 payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, dollarInCLP)) : undefined,
+                currency: 'CLP',
             }
         case 'USD': // CLP to USD
             return { ...inv, 
                 amount: Math.round(inv.amount / dollarInCLP),
                 payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, 1/dollarInCLP)) : undefined,
+                currency: 'USD',
             }
         default:
             return inv
@@ -110,7 +110,7 @@ const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
 const checkPaymentResponse = TE.fromPredicate(
     (response: PaymentResponse) => response.status == 'paid',
     (): WrongAmountError => ({
-        type: 'WrongAmountError',
+        type: 'WrongAmountError' as const,
         error: new Error('the paid amount is not correct')
     })
 )
@@ -122,11 +122,28 @@ const payPayment = (paymentId: string, amountToPay: number) => pipe(
     TE.flatMap(getResponseAsJson),
     TE.flatMap((pr) => parseSchema(pr, PaymentResponse)),
     TE.flatMap(checkPaymentResponse),
-    TE.match(
-        (e) => `ERROR: paying ${paymentId} ${e.error}`,
-        () => `SUCCESS: payment ${paymentId} succesfully paid`
-    )
 )
+
+type PaymentError = JsonStringifyError | JsonParseError | POSTError | WrongAmountError | SchemaParseError
+
+const processPayments = (payments: Payment[], toReduce: number) => {
+    let tasks = [] as TE.TaskEither<PaymentError, PaymentResponse>[]
+    payments.reverse().reduce(
+        (amountToReduce: number, payment: Payment) => {
+            if (payment.status === 'paid') {
+                return amountToReduce
+            } else if (amountToReduce >= payment.amount) {
+                tasks.push(payPayment(payment.id, 0))
+                return amountToReduce - payment.amount
+            } else {
+                tasks.push(payPayment(payment.id, payment.amount - amountToReduce))
+                return 0
+            }
+        },
+        toReduce
+    )
+    return tasks
+};
 
 const secondTestMain = async () => {
     const getData = pipe(
@@ -143,34 +160,27 @@ const secondTestMain = async () => {
     }
 
     const invoices = fetchedData.right
-    const receivedInvs = invoices.filter((inv) => inv.type === 'received')
     const creditNotes = invoices.filter((inv) => inv.type === 'credit_note')
+    const receivedInvs = invoices
+        .filter((inv) => inv.type === 'received')
+        .filter((inv) => inv.payments)
 
-    for (let i = 0; i < receivedInvs.length; i++) {
-        const invoice = receivedInvs[i]
-        if (!invoice.payments) {
-            continue
-        }
-        const creditNotesForInvoice = creditNotes.filter((cn) => cn.reference === invoice.id)
-        let amountToReduce = creditNotesForInvoice.reduce((acc, cn) => acc + cn.amount, 0)
-        invoice.payments.reverse()
+    const payInvoices = pipe(
+        receivedInvs,
+        A.map((inv) => {
+            const cnForInvoice = creditNotes.filter((cn) => cn.reference === inv.id)
+            const toReduce = cnForInvoice.reduce((acc: number, cn: Invoice) => acc + cn.amount, 0)
+            return processPayments(
+                inv.payments ? inv.payments : [], 
+                toReduce
+            )
+        }),
+        A.flatten,
+        A.sequence(TE.ApplicativeSeq)
+    )
 
-        for (let j = 0; j < invoice.payments.length; j++) {
-            const payment = invoice.payments[j]
-            if (payment.status === 'paid') {
-                continue // nothing to do
-            } else if (amountToReduce >= payment.amount) {
-                amountToReduce -= payment.amount
-                const paid = await payPayment(payment.id, 0)()
-                console.log(paid)
-            } else {
-                const amountToPay = payment.amount - amountToReduce
-                amountToReduce = 0
-                const paid = await payPayment(payment.id, amountToPay)()
-                console.log(paid)
-            }
-        }
-    }
+    const result = await payInvoices()
+    console.log(result)
 }
 secondTestMain()
 

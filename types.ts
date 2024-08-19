@@ -45,8 +45,8 @@ export type POSTError = {
     error: Error
 }
 
-export type JSONParseError = {
-    type: 'JSONParseError'
+export type JsonParseError = {
+    type: 'JsonParseError'
     error: Error
 }
 
