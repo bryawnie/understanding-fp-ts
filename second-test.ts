@@ -1,59 +1,18 @@
 import { pipe } from 'fp-ts/lib/function'
 import * as TE from 'fp-ts/TaskEither';
-import * as A from "fp-ts/Array";
-import * as E from 'fp-ts/Either'
-import * as t from 'io-ts'
+import * as A from 'fp-ts/Array';
+import * as E from 'fp-ts/Either';
+import * as J from 'fp-ts/Json';
+import * as t from 'io-ts';
+import { makeMatch } from 'ts-adt/MakeADT';
+import {
+    FetchError, POSTError, JSONParseError, SchemaParseError, JsonStringifyError,
+    Payment, Invoice, Invoices, OrgSettings, PaymentResponse,
+    WrongAmountError
+} from './types'
 
 const invoicesURL = 'https://recruiting.api.bemmbo.com/v2/invoices/pending';
-const dollarInCLP = 800
-
-const Payment = t.type({
-    id: t.string,
-    amount: t.number,
-    status: t.string,
-})
-
-const Invoice = t.type({
-    id: t.string,
-    amount: t.number,
-    organization_id: t.string,
-    currency: t.string,
-    type: t.string,
-    reference: t.union([t.string, t.undefined]),
-    payments: t.union([t.array(Payment), t.undefined]),
-})
-
-const Invoices = t.array(Invoice)
-
-const OrgSettings = t.type({
-    organization_id: t.string,
-    currency: t.string,
-})
-
-type Payment = t.TypeOf<typeof Payment>
-type Invoice = t.TypeOf<typeof Invoice>
-type Invoices = t.TypeOf<typeof Invoices>
-type OrgSettings = t.TypeOf<typeof OrgSettings>
-
-type FetchError = {
-    type: 'FetchError'
-    error: Error
-}
-
-type POSTError = {
-    type: 'POSTError'
-    error: Error
-}
-
-type JSONParseError = {
-    type: 'JSONParseError'
-    error: Error
-}
-
-type SchemaParseError = {
-    type: 'SchemaParseError'
-    error: Error
-}
+const dollarInCLP = 800;
 
 
 const fetchAPI = TE.tryCatchK(
@@ -64,8 +23,8 @@ const fetchAPI = TE.tryCatchK(
     })
 )
 
-const sendPOST = TE.tryCatchK(
-    (url: string, stringifiedData: string) => fetch(
+const sendPOST = (url: string) => TE.tryCatchK(
+    (stringifiedData: string) => fetch(
         url, {
             method: 'POST',
             body: stringifiedData,
@@ -84,6 +43,18 @@ const getResponseAsJson = TE.tryCatchK(
         error: (err instanceof Error ? err : new Error('unexpected error when parsing json'))
     })
 )
+
+const createResponse = (payload: unknown): E.Either<JsonStringifyError, string> =>
+    pipe(
+        payload,
+        J.stringify,
+        E.mapLeft(
+            (e): JsonStringifyError => ({
+                type: 'JsonStringifyError',
+                error: E.toError(e),
+            })
+        )
+    )
 
 const parseSchema = <T>(content: any, schema: t.Decoder<Record<string, any>, T>) => pipe(
     content,
@@ -121,12 +92,12 @@ const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
         return inv
     }
     switch (currency) {
-        case "CLP": // USD to CLP
+        case 'CLP': // USD to CLP
             return {...inv,
                 amount: inv.amount * dollarInCLP,
                 payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, dollarInCLP)) : undefined,
             }
-        case "USD": // CLP to USD
+        case 'USD': // CLP to USD
             return { ...inv, 
                 amount: Math.round(inv.amount / dollarInCLP),
                 payments: inv.payments ? inv.payments.map((pm) => normalizePayment(pm, 1/dollarInCLP)) : undefined,
@@ -136,7 +107,26 @@ const normalizeCurrency = (inv: Invoice) => TE.tryCatch( async () => {
     }
 }, (err) => err)
 
-const payPayment = () => true // declare payment as paid
+const checkPaymentResponse = TE.fromPredicate(
+    (response: PaymentResponse) => response.status == 'paid',
+    (): WrongAmountError => ({
+        type: 'WrongAmountError',
+        error: new Error('the paid amount is not correct')
+    })
+)
+
+const payPayment = (paymentId: string, amountToPay: number) => pipe(
+    createResponse({ amount: amountToPay }),
+    TE.fromEither,
+    TE.flatMap(sendPOST(`https://recruiting.api.bemmbo.com/payment/${paymentId}/pay`)),
+    TE.flatMap(getResponseAsJson),
+    TE.flatMap((pr) => parseSchema(pr, PaymentResponse)),
+    TE.flatMap(checkPaymentResponse),
+    TE.match(
+        (e) => `ERROR: paying ${paymentId} ${e.error}`,
+        () => `SUCCESS: payment ${paymentId} succesfully paid`
+    )
+)
 
 const secondTestMain = async () => {
     const getData = pipe(
@@ -148,7 +138,7 @@ const secondTestMain = async () => {
     )
 
     const fetchedData = await getData()
-    if(E.isLeft(fetchedData)){ // On error, return
+    if (E.isLeft(fetchedData)){ // On error, return
         return
     }
 
@@ -163,7 +153,7 @@ const secondTestMain = async () => {
         }
         const creditNotesForInvoice = creditNotes.filter((cn) => cn.reference === invoice.id)
         let amountToReduce = creditNotesForInvoice.reduce((acc, cn) => acc + cn.amount, 0)
-        invoice.payments.sort((inv1, inv2) => inv1.amount - inv2.amount)
+        invoice.payments.reverse()
 
         for (let j = 0; j < invoice.payments.length; j++) {
             const payment = invoice.payments[j]
@@ -171,14 +161,15 @@ const secondTestMain = async () => {
                 continue // nothing to do
             } else if (amountToReduce >= payment.amount) {
                 amountToReduce -= payment.amount
-                // pay 0
+                const paid = await payPayment(payment.id, 0)()
+                console.log(paid)
             } else {
                 const amountToPay = payment.amount - amountToReduce
                 amountToReduce = 0
-                // pay discounted payment
+                const paid = await payPayment(payment.id, amountToPay)()
+                console.log(paid)
             }
         }
-        console.log(`Reducing ${amountToReduce} to invoice ${invoice.id}`)
     }
 }
 secondTestMain()
