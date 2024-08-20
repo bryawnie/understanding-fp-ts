@@ -118,7 +118,7 @@ const normalizePayment = (payment: Payment, factor: number) => ({
   amount: Math.round(payment.amount * factor),
 });
 
-const normalizeCurrency = (orgBatch: OrgBatch) => {
+const normalizeOrgCurrency = (orgBatch: OrgBatch) => {
   const invoices = orgBatch.invoices;
   const currency = orgBatch.orgCurrency;
   return invoices.map((inv) => {
@@ -193,23 +193,23 @@ const processPayments = (payments: Payment[], toReduce: number) => {
   return tasks;
 };
 
+const normalizeInvoicesCurrency = (invoices: Invoices) => pipe(
+  invoices,
+  NEA.groupBy((inv) => inv.organization_id),
+  R.mapWithIndex((orgId, invs) => getOrganizationCurrency(orgId, invs)), // task(orgID) => invoices + config
+  R.collect(S.Ord)((_, v) => v),
+  A.map((orgElement) => pipe(orgElement, TE.map(normalizeOrgCurrency))),
+  A.sequence(TE.ApplicativeSeq),
+  TE.map((invsLst) => A.flatten(invsLst))
+)
+
 const secondTestMain = async () => {
   const getData = pipe(
     invoicesURL,
     fetchAPI,
     TE.flatMap(getResponseAsJson),
     TE.flatMap((invs) => parseSchema(invs, Invoices)),
-    TE.flatMap((invoices) =>
-      pipe(
-        invoices,
-        NEA.groupBy((inv) => inv.organization_id),
-        R.mapWithIndex((orgId, invs) => getOrganizationCurrency(orgId, invs)), // task(orgID) => invoices + config
-        R.collect(S.Ord)((_, v) => v),
-        A.map((orgElement) => pipe(orgElement, TE.map(normalizeCurrency))),
-        A.sequence(TE.ApplicativeSeq),
-        TE.map((iiiiinvs) => A.flatten(iiiiinvs))
-      )
-    )
+    TE.flatMap(normalizeInvoicesCurrency),
   );
 
   const fetchedData = await getData();
@@ -239,6 +239,10 @@ const secondTestMain = async () => {
   );
 
   const result = await payInvoices();
-  console.log(result);
+  if (E.isLeft(result)) {
+    console.error(result.left);
+    return;
+  }
+  console.log(result.right);
 };
 secondTestMain();
