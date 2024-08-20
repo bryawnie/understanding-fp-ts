@@ -1,2 +1,2 @@
-# fp-ts-prueba-2
+# Pan
 Jugando con fp-ts
